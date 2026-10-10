@@ -1,7 +1,7 @@
 // Shorts Studio - on-device, free, autonomous Shorts/Reels generator.
 //
 // Flow: script (topic -> Pollinations text | pasted Gemini JSON)
-//       -> images (Pollinations Flux, 1080x1920, neighbor-image fallback)
+//       -> images (VisualPipeline -> FluxVisualProvider, neighbor-image fallback removed)
 //       -> voice (Edge-TTS -> Google Translate TTS -> Android TTS, one engine per video)
 //       -> single FFmpeg pass: Ken Burns + ASS hardsub + synth music + ducking
 //       -> save to gallery + play + share.
@@ -11,7 +11,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 
 import 'package:crypto/crypto.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
@@ -27,6 +26,10 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+
+import 'models/scene.dart';
+import 'services/visuals/flux_visual_provider.dart';
+import 'services/visuals/visual_pipeline.dart';
 
 // ============================ CONSTANTS ============================
 const int kFps = 30;
@@ -54,17 +57,11 @@ enum VideoStyle {
 
   const VideoStyle(this.label, this.suffix, this.grade);
   final String label;
-  final String suffix; // appended to the image prompt
-  final String grade; // FFmpeg color grade filter
+  final String suffix;
+  final String grade;
 }
 
 // ============================ MODELS ============================
-class Scene {
-  Scene(this.voiceover, this.visualPrompt);
-  final String voiceover;
-  final String visualPrompt;
-}
-
 class Scenario {
   Scenario(this.title, this.scenes);
   final String title;
@@ -74,15 +71,15 @@ class Scenario {
 class WordTiming {
   WordTiming(this.text, this.start, this.end);
   final String text;
-  final double start; // seconds
+  final double start;
   final double end;
 }
 
 class SceneAudio {
   SceneAudio(this.file, this.speechSec, this.words);
-  final File file; // 44.1 kHz stereo wav with kSceneGap of silence at the end
+  final File file;
   final double speechSec;
-  final List<WordTiming> words; // relative to scene start
+  final List<WordTiming> words;
   double get totalSec => speechSec + kSceneGap;
 }
 
@@ -93,37 +90,34 @@ const String _scriptPromptTemplate =
 45-60 saniyelik, gizem ve merak uyandıran dikey video senaryosu yaz.
 Kurallar:
 - Toplam 130-160 kelime olsun.
-- İlk cümle (ilk 3 saniye) çok güçlü bir kanca (hook) olsun.
-- Yalnızca doğrulanabilir bilgiler kullan; emin olmadığın şeyi uydurma.
+- İlk cümle çok güçlü bir kanca (hook) olsun.
+- Yalnızca doğrulanabilir bilgiler kullan.
 - Son cümle merak bırakan bir kapanış olsun.
 - 4 ile 6 arası sahne üret.
-- "voiceover": SADECE seslendirilecek duru Türkçe metin (emoji, parantez, sahne notu YOK).
-- "visual_prompt": İngilizce; sahneyi anlatan somut görsel istemi (nesne, mekân, ışık, atmosfer). Yazı/logo ve yakın çekim insan yüzü içermesin.
+- "voiceover": SADECE seslendirilecek duru Türkçe metin.
+- "subject": İngilizce odak mekanizma veya nesne.
+- "action": İngilizce parçanın hareketi veya eylemi.
+- "camera": transparent side cutaway, close-up vb. kamera açısı.
+- "visual_prompt": Sahneyi anlatan somut görsel istemi (Yazı/logo içermesin).
 
 YALNIZCA şu JSON'u döndür:
-{"title": "kısa başlık", "scenes": [{"voiceover": "...", "visual_prompt": "..."}]}''';
+{"title": "kısa başlık", "scenes": [{"voiceover": "...", "subject": "...", "action": "...", "camera": "...", "visual_prompt": "..."}]}''';
 
 String scriptPrompt(String topic) => _scriptPromptTemplate.replaceAll('{TOPIC}', topic);
 
-/// Turkish-aware upper case (i -> İ, ı -> I).
-String trUpper(String s) => s
-    .replaceAll('i', 'İ')
-    .replaceAll('ı', 'I')
-    .toUpperCase();
+String trUpper(String s) => s.replaceAll('i', 'İ').replaceAll('ı', 'I').toUpperCase();
 
 String _hex(int n) {
   final r = Random.secure();
   return List.generate(n, (_) => r.nextInt(16).toRadixString(16)).join();
 }
 
-/// Short one-line error text for the on-screen log.
 String shortErr(Object? e) {
   var s = '$e'.replaceAll(RegExp(r'\s+'), ' ');
   if (s.length > 150) s = '${s.substring(0, 150)}...';
   return s;
 }
 
-/// Runs an FFmpeg command; on failure throws with the tail of the log.
 Future<void> runFfmpeg(List<String> args, {void Function(double seconds)? onTime}) async {
   final done = Completer<void>();
   await FFmpegKit.executeWithArgumentsAsync(
@@ -180,12 +174,13 @@ class ScenarioService {
     for (var i = 0; i < rawScenes.length && i < 6; i++) {
       final s = rawScenes[i];
       if (s is! Map) throw FormatException('Sahne ${i + 1} geçersiz.');
-      final vo = _cleanVoice('${s['voiceover'] ?? ''}');
-      final vp = '${s['visual_prompt'] ?? ''}'.trim();
-      if (vo.isEmpty || vp.isEmpty) {
-        throw FormatException('Sahne ${i + 1}: "voiceover" ve "visual_prompt" dolu olmalı.');
+      final map = Map<String, dynamic>.from(s);
+      map['voiceover'] = _cleanVoice('${map['voiceover'] ?? ''}');
+      final scene = Scene.fromJson(map);
+      if (scene.voiceover.isEmpty || scene.visualPrompt.isEmpty) {
+        throw FormatException('Sahne ${i + 1}: voiceover ve visual_prompt dolu olmalı.');
       }
-      scenes.add(Scene(vo, vp));
+      scenes.add(scene);
     }
     final title = data is Map ? '${data['title'] ?? 'Shorts'}' : 'Shorts';
     return Scenario(title, scenes);
@@ -197,7 +192,6 @@ class ScenarioService {
     return t.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
-  /// Topic only: free Pollinations text API writes the script.
   static Future<Scenario> fromTopic(String topic) async {
     Object? last;
     for (var attempt = 1; attempt <= 3; attempt++) {
@@ -228,95 +222,11 @@ class ScenarioService {
         await Future.delayed(Duration(seconds: 3 * attempt));
       }
     }
-    throw Exception(
-      'Senaryo otomatik üretilemedi (${shortErr(last)}).\n'
-      '"Gemini istemini kopyala" ile istemi Gemini Web\'e verip dönen JSON\'u buraya yapıştırın.',
-    );
+    throw Exception('Senaryo otomatik üretilemedi (${shortErr(last)}).');
   }
 }
 
-// ============================ 2) IMAGES ============================
-class ImageService {
-  /// Returns null when every attempt fails (the caller then reuses a neighbor scene image).
-  static Future<File?> tryFetch(
-    Scene scene,
-    int i,
-    Directory dir,
-    String styleSuffix,
-    void Function(String) log,
-  ) async {
-    var prompt = '${scene.visualPrompt}, $styleSuffix';
-    if (prompt.length > 700) prompt = prompt.substring(0, 700);
-
-    for (var attempt = 1; attempt <= 4; attempt++) {
-      // First two attempts: full HD. Later attempts: smaller image (faster, fewer timeouts).
-      final big = attempt <= 2;
-      final w = big ? 1080 : 720;
-      final h = big ? 1920 : 1280;
-      try {
-        final seed = Random().nextInt(999999);
-        final url = Uri.parse(
-          'https://image.pollinations.ai/prompt/${Uri.encodeComponent(prompt)}'
-          '?width=$w&height=$h&model=flux&nologo=true&seed=$seed',
-        );
-        final r = await http
-            .get(url, headers: {'User-Agent': 'Mozilla/5.0 ShortsStudio'})
-            .timeout(Duration(seconds: big ? 120 : 90));
-        final ct = r.headers['content-type'] ?? '';
-        if (r.statusCode == 200 && ct.startsWith('image') && r.bodyBytes.length > 5000) {
-          final b = r.bodyBytes;
-          final codec = await ui.instantiateImageCodec(b); // throws if the image is corrupt
-          codec.dispose();
-          var ext = 'jpg';
-          if (b[0] == 0x89 && b[1] == 0x50) {
-            ext = 'png';
-          } else if (b[0] == 0x52 && b[1] == 0x49 && b[8] == 0x57) {
-            ext = 'webp';
-          }
-          final out = File('${dir.path}/img_$i.$ext');
-          await out.writeAsBytes(b);
-          return out;
-        }
-        log('Görsel ${i + 1}: HTTP ${r.statusCode}, deneme $attempt/4');
-      } catch (e) {
-        log('Görsel ${i + 1}: deneme $attempt/4 başarısız (${shortErr(e)})');
-      }
-      await Future.delayed(Duration(seconds: 3 * attempt));
-    }
-    return null;
-  }
-
-  /// Fills failed scenes with the previous scene image (or the next one for leading gaps),
-  /// so the video never shows a black screen. If nothing downloaded, uses a dark-blue solid.
-  static Future<List<File>> fillGaps(List<File?> raw, Directory dir, void Function(String) log) async {
-    final first = raw.indexWhere((f) => f != null);
-    final out = <File>[];
-    if (first < 0) {
-      log('Hiçbir görsel indirilemedi; düz renkli yedek arka plan kullanılıyor.');
-      for (var i = 0; i < raw.length; i++) {
-        final f = File('${dir.path}/img_solid_$i.jpg');
-        await runFfmpeg([
-          '-y', '-f', 'lavfi', '-i', 'color=c=0x1b1b4b:s=1080x1920:d=1',
-          '-frames:v', '1', '-pix_fmt', 'yuvj420p', '-q:v', '2', f.path,
-        ]);
-        out.add(f);
-      }
-      return out;
-    }
-    for (var i = 0; i < raw.length; i++) {
-      final f = raw[i];
-      if (f != null) {
-        out.add(f);
-      } else {
-        log('Sahne ${i + 1}: görsel indirilemedi, komşu sahnenin görseli kullanılıyor.');
-        out.add(out.isEmpty ? raw[first]! : out[i - 1]);
-      }
-    }
-    return out;
-  }
-}
-
-// ============================ 3) VOICE ============================
+// ============================ 2) VOICE ============================
 class EdgeResult {
   EdgeResult(this.audio, this.words);
   final Uint8List audio;
@@ -332,8 +242,7 @@ class EdgeTts {
 
   static String _ua(String ver) {
     final major = ver.split('.').first;
-    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-        'Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0';
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0';
   }
 
   static String _gec() {
@@ -348,8 +257,7 @@ class EdgeTts {
     const m = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     final t = DateTime.now().toUtc();
     String p(int v) => v.toString().padLeft(2, '0');
-    return '${d[t.weekday - 1]} ${m[t.month - 1]} ${p(t.day)} ${t.year} '
-        '${p(t.hour)}:${p(t.minute)}:${p(t.second)} GMT+0000 (Coordinated Universal Time)';
+    return '${d[t.weekday - 1]} ${m[t.month - 1]} ${p(t.day)} ${t.year} ${p(t.hour)}:${p(t.minute)}:${p(t.second)} GMT+0000 (Coordinated Universal Time)';
   }
 
   static Future<void> _syncClock() async {
@@ -382,8 +290,7 @@ class EdgeTts {
           last = e;
           log('Edge-TTS (v$ver, deneme $attempt/3): ${shortErr(e)}');
           final msg = '$e';
-          final rejected = msg.contains('403') || msg.contains('401') || msg.contains('not upgraded');
-          if (!rejected) break;
+          if (!msg.contains('403') && !msg.contains('401') && !msg.contains('not upgraded')) break;
         }
       }
       await Future.delayed(Duration(seconds: 2 * attempt));
@@ -393,8 +300,7 @@ class EdgeTts {
 
   static Future<EdgeResult> _once(String text, String rate, String ver) async {
     final major = ver.split('.').first;
-    final url = 'wss://$_base/edge/v1?TrustedClientToken=$_token&Sec-MS-GEC=${_gec()}'
-        '&Sec-MS-GEC-Version=1-$ver&ConnectionId=${_hex(32)}';
+    final url = 'wss://$_base/edge/v1?TrustedClientToken=$_token&Sec-MS-GEC=${_gec()}&Sec-MS-GEC-Version=1-$ver&ConnectionId=${_hex(32)}';
 
     final client = HttpClient()
       ..userAgent = _ua(ver)
@@ -466,17 +372,10 @@ class EdgeTts {
         '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false",'
         '"wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-96kbitrate-mono-mp3"}}}}\r\n',
       );
-      final esc = text
-          .replaceAll('&', '&amp;')
-          .replaceAll('<', '&lt;')
-          .replaceAll('>', '&gt;')
-          .replaceAll('"', '&quot;')
-          .replaceAll("'", '&apos;');
+      final esc = text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&apos;');
       final ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='tr-TR'>"
           "<voice name='$kEdgeVoice'><prosody pitch='+0Hz' rate='$rate' volume='+0%'>$esc</prosody></voice></speak>";
-      socket.add(
-        'X-RequestId:${_hex(32)}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml',
-      );
+      socket.add('X-RequestId:${_hex(32)}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml');
 
       await done.future.timeout(const Duration(seconds: 60));
       final bytes = audio.toBytes();
@@ -493,18 +392,13 @@ class EdgeTts {
   }
 }
 
-/// Fallback: Google Translate TTS
 class GoogleTts {
-  static const _ua =
-      'Mozilla/5.0 (Linux; Android 14; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+  static const _ua = 'Mozilla/5.0 (Linux; Android 14; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
 
   static List<String> _chunks(String text, {int max = 180}) {
     final out = <String>[];
     var cur = '';
-    final sentences = RegExp(r'[^.!?;:]+[.!?;:]*')
-        .allMatches(text)
-        .map((m) => m.group(0)!.trim())
-        .where((s) => s.isNotEmpty);
+    final sentences = RegExp(r'[^.!?;:]+[.!?;:]*').allMatches(text).map((m) => m.group(0)!.trim()).where((s) => s.isNotEmpty);
     for (final s in sentences) {
       if (s.length > max) {
         if (cur.isNotEmpty) {
@@ -550,9 +444,7 @@ class GoogleTts {
             'https://translate.google.com/translate_tts?ie=UTF-8&tl=tr&client=tw-ob'
             '&total=1&idx=0&textlen=${chunks[c].length}&q=${Uri.encodeComponent(chunks[c])}',
           );
-          final r = await http
-              .get(url, headers: {'User-Agent': _ua, 'Referer': 'https://translate.google.com/'})
-              .timeout(const Duration(seconds: 30));
+          final r = await http.get(url, headers: {'User-Agent': _ua, 'Referer': 'https://translate.google.com/'}).timeout(const Duration(seconds: 30));
           final ct = r.headers['content-type'] ?? '';
           if (r.statusCode == 200 && ct.contains('audio') && r.bodyBytes.length > 500) {
             await f.writeAsBytes(r.bodyBytes);
@@ -581,9 +473,7 @@ class AndroidTts {
     final tts = FlutterTts();
     final ok = await tts.isLanguageAvailable('tr-TR');
     if (ok != true) {
-      throw Exception(
-        'Telefonda Türkçe TTS sesi yok. Ayarlar > Genel yönetim > Metin okuma bölümünden Türkçe ses verisini indirin.',
-      );
+      throw Exception('Telefonda Türkçe TTS sesi yok.');
     }
     await tts.setLanguage('tr-TR');
     await tts.setSpeechRate(0.5);
@@ -630,19 +520,13 @@ class TtsService {
       if (!failed) return results;
       e++;
       if (e >= _Engine.values.length) {
-        throw Exception('Hiçbir seslendirme motoru çalışmadı. İnternet bağlantınızı ve telefonun Türkçe TTS verisini kontrol edin.');
+        throw Exception('Hiçbir seslendirme motoru çalışmadı.');
       }
       log('Sonraki motora geçiliyor: ${_Engine.values[e].label}');
     }
   }
 
-  static Future<SceneAudio> _synthOne(
-    _Engine engine,
-    String text,
-    int i,
-    Directory dir,
-    void Function(String) log,
-  ) async {
+  static Future<SceneAudio> _synthOne(_Engine engine, String text, int i, Directory dir, void Function(String) log) async {
     File src;
     var words = <WordTiming>[];
     if (engine == _Engine.edge) {
@@ -658,9 +542,7 @@ class TtsService {
 
     final speech = await probeDuration(src.path);
     final out = File('${dir.path}/vo_${i}_pad.wav');
-    await runFfmpeg([
-      '-y', '-i', src.path, '-ar', '44100', '-ac', '2', '-af', 'apad=pad_dur=$kSceneGap', out.path,
-    ]);
+    await runFfmpeg(['-y', '-i', src.path, '-ar', '44100', '-ac', '2', '-af', 'apad=pad_dur=$kSceneGap', out.path]);
     if (words.isEmpty) words = _estimateWords(text, speech);
     return SceneAudio(out, speech, words);
   }
@@ -697,7 +579,7 @@ class TtsService {
   }
 }
 
-// ============================ 4) SUBTITLES (ASS) ============================
+// ============================ 3) SUBTITLES (ASS) ============================
 class _Ev {
   _Ev(this.start, this.end, this.text);
   double start;
@@ -706,9 +588,7 @@ class _Ev {
 }
 
 class SubtitleBuilder {
-  static final RegExp _strip = RegExp(
-    '^[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+|[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+\$',
-  );
+  static final RegExp _strip = RegExp('^[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+|[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+\$');
 
   static String _t(double t) {
     final cs = (max(t, 0) * 100).round();
@@ -767,9 +647,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         final wi = g[pos];
         final start = clean[wi].start;
         final end = pos + 1 < g.length ? clean[g[pos + 1]].start : clean[wi].end + 0.10;
-        final text = g
-            .map((j) => j == wi ? '{\\1c&H00FFFF&}${clean[j].text}{\\1c&HFFFFFF&}' : clean[j].text)
-            .join(' ');
+        final text = g.map((j) => j == wi ? '{\\1c&H00FFFF&}${clean[j].text}{\\1c&HFFFFFF&}' : clean[j].text).join(' ');
         events.add(_Ev(start, max(end, start + 0.06), text));
       }
     }
@@ -785,12 +663,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       lines.writeln('Dialogue: 0,${_t(e.start)},${_t(e.end)},Main,,0,0,0,,${e.text}');
     }
     final f = File('${dir.path}/subs.ass');
-    await f.writeAsBytes(utf8.encode(head + lines.toString())); // Zorunlu UTF-8
+    await f.writeAsBytes(utf8.encode(head + lines.toString()));
     return f;
   }
 }
 
-// ============================ 5) FFMPEG RENDER ============================
+// ============================ 4) FFMPEG RENDER ============================
 class Renderer {
   static const _motions = ['zoom_in', 'pan_down', 'zoom_out', 'pan_right', 'pan_up', 'zoom_in'];
 
@@ -878,7 +756,7 @@ class Renderer {
   }
 }
 
-// ============================ 6) PIPELINE ============================
+// ============================ 5) PIPELINE ============================
 class Pipeline {
   Pipeline({required this.onStage, required this.onLog});
   final void Function(int step, String label, double progress) onStage;
@@ -893,7 +771,7 @@ class Pipeline {
       await dir.create(recursive: true);
 
       // --- [1/4] Script + images
-      onStage(1, '[1/4] Görseller indiriliyor...', 0.01);
+      onStage(1, '[1/4] Görseller üretiliyor...', 0.01);
       final Scenario scenario;
       if (ScenarioService.looksLikeJson(input)) {
         onLog('Yapıştırılan JSON ayrıştırılıyor...');
@@ -905,14 +783,16 @@ class Pipeline {
       onLog('Başlık: ${scenario.title} • ${scenario.scenes.length} sahne');
       final n = scenario.scenes.length;
 
-      final rawImages = <File?>[];
-      for (var i = 0; i < n; i++) {
-        onLog('Görsel ${i + 1}/$n indiriliyor...');
-        rawImages.add(await ImageService.tryFetch(scenario.scenes[i], i, dir, style.suffix, onLog));
-        onStage(1, '[1/4] Görseller indiriliyor... (${i + 1}/$n)', 0.05 + 0.30 * (i + 1) / n);
-        if (i < n - 1) await Future.delayed(const Duration(seconds: 2));
-      }
-      final images = await ImageService.fillGaps(rawImages, dir, onLog);
+      final visualPipeline = VisualPipeline(FluxVisualProvider());
+      final images = await visualPipeline.generateAll(
+        scenes: scenario.scenes,
+        outputDir: dir,
+        styleSuffix: style.suffix,
+        log: onLog,
+        onProgress: (done, total) {
+          onStage(1, '[1/4] Görseller üretiliyor... ($done/$total)', 0.05 + 0.30 * done / total);
+        },
+      );
 
       // --- [2/4] Voice
       onStage(2, '[2/4] Seslendiriliyor...', 0.35);
@@ -1007,7 +887,7 @@ class _HomePageState extends State<HomePage> {
   final List<String> _logs = [];
 
   static const _steps = [
-    'Görseller indiriliyor',
+    'Görseller üretiliyor',
     'Seslendiriliyor',
     'FFmpeg ile render',
     'Galeriye kaydedildi',
