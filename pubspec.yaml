@@ -1,0 +1,32 @@
+name: shorts_studio
+description: Otonom TÃ¼rkÃ§e YouTube Shorts / Reels Ã¼retici (tamamen cihaz Ã¼stÃ¼nde, Ã¼cretsiz).
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # FFmpeg: orijinal ffmpeg_kit_flutter_full_gpl proje kapandÄ±ÄŸÄ± iÃ§in artÄ±k derlenmiyor.
+  # BakÄ±mÄ± sÃ¼ren fork (Full-GPL: libx264, zoompan, ass/libass, sidechaincompress dahil):
+  ffmpeg_kit_flutter_new: ^4.5.3
+
+  path_provider: ^2.1.5      # geÃ§ici Ã§alÄ±ÅŸma klasÃ¶rÃ¼
+  http: ^1.2.2               # Pollinations gÃ¶rsel/metin indirme
+  crypto: ^3.0.6             # Edge-TTS Sec-MS-GEC belirteci (SHA-256)
+  flutter_tts: ^4.2.0        # yedek: Android yerel TÃ¼rkÃ§e TTS (dosyaya sentez)
+  gal: ^2.3.1                # Galeriye kaydet (Android 10+ izin istemez; permission_handler gerekmez)
+  video_player: ^2.9.2       # uygulama iÃ§i oynatÄ±cÄ±
+  share_plus: ^10.1.4        # PaylaÅŸ
+  wakelock_plus: ^1.2.10     # render sÄ±rasÄ±nda ekran kapanmasÄ±n
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
