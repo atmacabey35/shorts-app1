@@ -1,10 +1,10 @@
-// Shorts Studio - tamamen cihaz Ã¼stÃ¼nde, Ã¼cretsiz, otonom Shorts/Reels Ã¼retici.
+// Shorts Studio - on-device, free, autonomous Shorts/Reels generator.
 //
-// AkÄ±ÅŸ: Senaryo (konu -> Pollinations metin | yapÄ±ÅŸtÄ±rÄ±lan Gemini JSON)
-//       -> GÃ¶rseller (Pollinations Flux, 1080x1920)
-//       -> Seslendirme (Edge-TTS, olmazsa Android yerel TTS)
-//       -> Tek geÃ§iÅŸte FFmpeg: Ken Burns + altyazÄ± (ASS hardsub) + sentez mÃ¼zik + ducking
-//       -> Galeriye kaydet + oynat + paylaÅŸ.
+// Flow: script (topic -> Pollinations text | pasted Gemini JSON)
+//       -> images (Pollinations Flux, 1080x1920, neighbor-image fallback)
+//       -> voice (Edge-TTS -> Google Translate TTS -> Android TTS, one engine per video)
+//       -> single FFmpeg pass: Ken Burns + ASS hardsub + synth music + ducking
+//       -> save to gallery + play + share.
 
 import 'dart:async';
 import 'dart:convert';
@@ -28,12 +28,12 @@ import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-// ============================ SABÄ°TLER ============================
+// ============================ CONSTANTS ============================
 const int kFps = 30;
-const double kSceneGap = 0.30; // sahneler arasÄ± sessizlik (sn)
-const double kEndTail = 0.60; // video sonu payÄ± (sn)
+const double kSceneGap = 0.30; // silence between scenes (sec)
+const double kEndTail = 0.60; // tail after the last scene (sec)
 const String kEdgeVoice = 'Microsoft Server Speech Text to Speech Voice (tr-TR, AhmetNeural)';
-const String kSubtitleFont = 'Roboto'; // Android sistem fontu, TÃ¼rkÃ§e karakter destekler
+const String kSubtitleFont = 'Roboto'; // Android system font, has Turkish glyphs
 
 enum VideoStyle {
   cinematic(
@@ -47,18 +47,18 @@ enum VideoStyle {
     'eq=contrast=1.12:saturation=0.75:brightness=-0.03,vignette=PI/5',
   ),
   cartoon(
-    'KarikatÃ¼r',
+    'Karikatür',
     'stylized 3D cartoon animation style, vibrant colors, soft lighting, expressive, high detail, vertical 9:16 composition',
     'eq=contrast=1.05:saturation=1.35',
   );
 
   const VideoStyle(this.label, this.suffix, this.grade);
   final String label;
-  final String suffix; // gÃ¶rsel istemine eklenir
-  final String grade; // FFmpeg renk dÃ¼zenleme filtresi
+  final String suffix; // appended to the image prompt
+  final String grade; // FFmpeg color grade filter
 }
 
-// ============================ MODELLER ============================
+// ============================ MODELS ============================
 class Scene {
   Scene(this.voiceover, this.visualPrompt);
   final String voiceover;
@@ -74,45 +74,56 @@ class Scenario {
 class WordTiming {
   WordTiming(this.text, this.start, this.end);
   final String text;
-  final double start; // saniye
+  final double start; // seconds
   final double end;
 }
 
 class SceneAudio {
   SceneAudio(this.file, this.speechSec, this.words);
-  final File file; // 44.1 kHz stereo wav, sonunda kSceneGap sessizlik
+  final File file; // 44.1 kHz stereo wav with kSceneGap of silence at the end
   final double speechSec;
-  final List<WordTiming> words; // sahne baÅŸlangÄ±cÄ±na gÃ¶re
+  final List<WordTiming> words; // relative to scene start
   double get totalSec => speechSec + kSceneGap;
 }
 
-// ============================ YARDIMCILAR ============================
+// ============================ HELPERS ============================
 const String _scriptPromptTemplate =
     '''Sen viral YouTube Shorts senaristisisin. Konu: "{TOPIC}"
 
-45-60 saniyelik, gizem ve merak uyandÄ±ran dikey video senaryosu yaz.
+45-60 saniyelik, gizem ve merak uyandıran dikey video senaryosu yaz.
 Kurallar:
 - Toplam 130-160 kelime olsun.
-- Ä°lk cÃ¼mle (ilk 3 saniye) Ã§ok gÃ¼Ã§lÃ¼ bir kanca (hook) olsun.
-- YalnÄ±zca doÄŸrulanabilir bilgiler kullan; emin olmadÄ±ÄŸÄ±n ÅŸeyi uydurma.
-- Son cÃ¼mle merak bÄ±rakan bir kapanÄ±ÅŸ olsun.
-- 4 ile 6 arasÄ± sahne Ã¼ret.
-- "voiceover": SADECE seslendirilecek duru TÃ¼rkÃ§e metin (emoji, parantez, sahne notu YOK).
-- "visual_prompt": Ä°ngilizce; sahneyi anlatan somut gÃ¶rsel istemi (nesne, mekÃ¢n, Ä±ÅŸÄ±k, atmosfer). YazÄ±/logo ve yakÄ±n Ã§ekim insan yÃ¼zÃ¼ iÃ§ermesin.
+- İlk cümle (ilk 3 saniye) çok güçlü bir kanca (hook) olsun.
+- Yalnızca doğrulanabilir bilgiler kullan; emin olmadığın şeyi uydurma.
+- Son cümle merak bırakan bir kapanış olsun.
+- 4 ile 6 arası sahne üret.
+- "voiceover": SADECE seslendirilecek duru Türkçe metin (emoji, parantez, sahne notu YOK).
+- "visual_prompt": İngilizce; sahneyi anlatan somut görsel istemi (nesne, mekân, ışık, atmosfer). Yazı/logo ve yakın çekim insan yüzü içermesin.
 
-YALNIZCA ÅŸu JSON'u dÃ¶ndÃ¼r:
-{"title": "kÄ±sa baÅŸlÄ±k", "scenes": [{"voiceover": "...", "visual_prompt": "..."}]}''';
+YALNIZCA şu JSON'u döndür:
+{"title": "kısa başlık", "scenes": [{"voiceover": "...", "visual_prompt": "..."}]}''';
 
 String scriptPrompt(String topic) => _scriptPromptTemplate.replaceAll('{TOPIC}', topic);
 
-String trUpper(String s) => s.replaceAll('i', 'Ä°').replaceAll('Ä±', 'I').toUpperCase();
+/// Turkish-aware upper case (i -> İ, ı -> I).
+String trUpper(String s) => s
+    .replaceAll('i', 'İ')
+    .replaceAll('ı', 'I')
+    .toUpperCase();
 
 String _hex(int n) {
   final r = Random.secure();
   return List.generate(n, (_) => r.nextInt(16).toRadixString(16)).join();
 }
 
-/// Bir FFmpeg komutunu Ã§alÄ±ÅŸtÄ±rÄ±r; hata olursa gÃ¼nlÃ¼ÄŸÃ¼n sonunu istisna olarak fÄ±rlatÄ±r.
+/// Short one-line error text for the on-screen log.
+String shortErr(Object? e) {
+  var s = '$e'.replaceAll(RegExp(r'\s+'), ' ');
+  if (s.length > 150) s = '${s.substring(0, 150)}...';
+  return s;
+}
+
+/// Runs an FFmpeg command; on failure throws with the tail of the log.
 Future<void> runFfmpeg(List<String> args, {void Function(double seconds)? onTime}) async {
   final done = Completer<void>();
   await FFmpegKit.executeWithArgumentsAsync(
@@ -127,7 +138,7 @@ Future<void> runFfmpeg(List<String> args, {void Function(double seconds)? onTime
           logs = (await session.getAllLogsAsString()) ?? '';
         } catch (_) {}
         final tail = logs.length > 1500 ? logs.substring(logs.length - 1500) : logs;
-        if (!done.isCompleted) done.completeError(Exception('FFmpeg hatasÄ± (kod: $rc)\n$tail'));
+        if (!done.isCompleted) done.completeError(Exception('FFmpeg hatası (kod: $rc)\n$tail'));
       }
     },
     null,
@@ -145,11 +156,11 @@ Future<double> probeDuration(String path) async {
   final session = await FFprobeKit.getMediaInformation(path);
   final info = await session.getMediaInformation();
   final d = double.tryParse((await info?.getDuration()) ?? '');
-  if (d == null || d <= 0) throw Exception('Ses sÃ¼resi okunamadÄ±: $path');
+  if (d == null || d <= 0) throw Exception('Ses süresi okunamadı: $path');
   return d;
 }
 
-// ============================ 1) SENARYO ============================
+// ============================ 1) SCRIPT ============================
 class ScenarioService {
   static bool looksLikeJson(String s) => s.contains('{') && s.contains('"scenes"');
 
@@ -157,22 +168,22 @@ class ScenarioService {
     var text = raw.trim();
     final open = text.indexOf(RegExp(r'[\{\[]'));
     final close = max(text.lastIndexOf('}'), text.lastIndexOf(']'));
-    if (open < 0 || close <= open) throw const FormatException('JSON bulunamadÄ±.');
+    if (open < 0 || close <= open) throw const FormatException('JSON bulunamadı.');
     text = text.substring(open, close + 1);
 
     final dynamic data = jsonDecode(text);
     final dynamic rawScenes = data is List ? data : (data is Map ? data['scenes'] : null);
     if (rawScenes is! List || rawScenes.isEmpty) {
-      throw const FormatException('JSON iÃ§inde dolu bir "scenes" listesi yok.');
+      throw const FormatException('JSON içinde dolu bir "scenes" listesi yok.');
     }
     final scenes = <Scene>[];
     for (var i = 0; i < rawScenes.length && i < 6; i++) {
       final s = rawScenes[i];
-      if (s is! Map) throw FormatException('Sahne ${i + 1} geÃ§ersiz.');
+      if (s is! Map) throw FormatException('Sahne ${i + 1} geçersiz.');
       final vo = _cleanVoice('${s['voiceover'] ?? ''}');
       final vp = '${s['visual_prompt'] ?? ''}'.trim();
       if (vo.isEmpty || vp.isEmpty) {
-        throw FormatException('Sahne ${i + 1}: "voiceover" ve "visual_prompt" dolu olmalÄ±.');
+        throw FormatException('Sahne ${i + 1}: "voiceover" ve "visual_prompt" dolu olmalı.');
       }
       scenes.add(Scene(vo, vp));
     }
@@ -186,7 +197,7 @@ class ScenarioService {
     return t.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
-  /// Konu girildiyse Ã¼cretsiz Pollinations metin API'siyle senaryo Ã¼retir.
+  /// Topic only: free Pollinations text API writes the script.
   static Future<Scenario> fromTopic(String topic) async {
     Object? last;
     for (var attempt = 1; attempt <= 3; attempt++) {
@@ -218,35 +229,44 @@ class ScenarioService {
       }
     }
     throw Exception(
-      'Senaryo otomatik Ã¼retilemedi ($last).\n'
-      '"Gemini istemini kopyala" ile istemi Gemini Web\'e verip dÃ¶nen JSON\'u buraya yapÄ±ÅŸtÄ±rÄ±n.',
+      'Senaryo otomatik üretilemedi (${shortErr(last)}).\n'
+      '"Gemini istemini kopyala" ile istemi Gemini Web\'e verip dönen JSON\'u buraya yapıştırın.',
     );
   }
 }
 
-// ============================ 2) GÃ–RSELLER ============================
+// ============================ 2) IMAGES ============================
 class ImageService {
-  static Future<File> fetch(Scene scene, int i, Directory dir, String styleSuffix) async {
+  /// Returns null when every attempt fails (the caller then reuses a neighbor scene image).
+  static Future<File?> tryFetch(
+    Scene scene,
+    int i,
+    Directory dir,
+    String styleSuffix,
+    void Function(String) log,
+  ) async {
     var prompt = '${scene.visualPrompt}, $styleSuffix';
     if (prompt.length > 700) prompt = prompt.substring(0, 700);
-    final file = File('${dir.path}/img_$i.jpg');
 
     for (var attempt = 1; attempt <= 4; attempt++) {
+      // First two attempts: full HD. Later attempts: smaller image (faster, fewer timeouts).
+      final big = attempt <= 2;
+      final w = big ? 1080 : 720;
+      final h = big ? 1920 : 1280;
       try {
         final seed = Random().nextInt(999999);
         final url = Uri.parse(
           'https://image.pollinations.ai/prompt/${Uri.encodeComponent(prompt)}'
-          '?width=1080&height=1920&model=flux&nologo=true&seed=$seed',
+          '?width=$w&height=$h&model=flux&nologo=true&seed=$seed',
         );
         final r = await http
             .get(url, headers: {'User-Agent': 'Mozilla/5.0 ShortsStudio'})
-            .timeout(const Duration(seconds: 180));
+            .timeout(Duration(seconds: big ? 120 : 90));
         final ct = r.headers['content-type'] ?? '';
         if (r.statusCode == 200 && ct.startsWith('image') && r.bodyBytes.length > 5000) {
-          final codec = await ui.instantiateImageCodec(r.bodyBytes); // bozuk gÃ¶rsel ise fÄ±rlatÄ±r
-          codec.dispose();
-          // UzantÄ±yÄ± gerÃ§ek iÃ§eriÄŸe gÃ¶re seÃ§ (PNG/WEBP gelirse FFmpeg ÅŸaÅŸÄ±rmasÄ±n)
           final b = r.bodyBytes;
+          final codec = await ui.instantiateImageCodec(b); // throws if the image is corrupt
+          codec.dispose();
           var ext = 'jpg';
           if (b[0] == 0x89 && b[1] == 0x50) {
             ext = 'png';
@@ -257,35 +277,67 @@ class ImageService {
           await out.writeAsBytes(b);
           return out;
         }
-      } catch (_) {}
-      await Future.delayed(Duration(seconds: 4 * attempt));
+        log('Görsel ${i + 1}: HTTP ${r.statusCode}, deneme $attempt/4');
+      } catch (e) {
+        log('Görsel ${i + 1}: deneme $attempt/4 başarısız (${shortErr(e)})');
+      }
+      await Future.delayed(Duration(seconds: 3 * attempt));
     }
-    // Yedek: FFmpeg ile koyu dÃ¼z arka plan (akÄ±ÅŸ asla Ã§Ã¶kmesin)
-    const colors = ['0x0b0b1f', '0x1f0b0b', '0x0b1a1f'];
-    await runFfmpeg([
-      '-y', '-f', 'lavfi', '-i', 'color=c=${colors[i % 3]}:s=1080x1920:d=1',
-      '-frames:v', '1', '-pix_fmt', 'yuvj420p', '-q:v', '2', file.path,
-    ]);
-    return file;
+    return null;
+  }
+
+  /// Fills failed scenes with the previous scene image (or the next one for leading gaps),
+  /// so the video never shows a black screen. If nothing downloaded, uses a dark-blue solid.
+  static Future<List<File>> fillGaps(List<File?> raw, Directory dir, void Function(String) log) async {
+    final first = raw.indexWhere((f) => f != null);
+    final out = <File>[];
+    if (first < 0) {
+      log('Hiçbir görsel indirilemedi; düz renkli yedek arka plan kullanılıyor.');
+      for (var i = 0; i < raw.length; i++) {
+        final f = File('${dir.path}/img_solid_$i.jpg');
+        await runFfmpeg([
+          '-y', '-f', 'lavfi', '-i', 'color=c=0x1b1b4b:s=1080x1920:d=1',
+          '-frames:v', '1', '-pix_fmt', 'yuvj420p', '-q:v', '2', f.path,
+        ]);
+        out.add(f);
+      }
+      return out;
+    }
+    for (var i = 0; i < raw.length; i++) {
+      final f = raw[i];
+      if (f != null) {
+        out.add(f);
+      } else {
+        log('Sahne ${i + 1}: görsel indirilemedi, komşu sahnenin görseli kullanılıyor.');
+        out.add(out.isEmpty ? raw[first]! : out[i - 1]);
+      }
+    }
+    return out;
   }
 }
 
-// ============================ 3) SESLENDÄ°RME ============================
+// ============================ 3) VOICE ============================
 class EdgeResult {
   EdgeResult(this.audio, this.words);
   final Uint8List audio;
   final List<WordTiming> words;
 }
 
-/// Microsoft Edge "Read Aloud" WebSocket protokolÃ¼.
-/// NOT: Microsoft Sec-MS-GEC-Version sabitini zaman zaman deÄŸiÅŸtirir; birkaÃ§ sÃ¼rÃ¼m denenir,
-/// hepsi baÅŸarÄ±sÄ±z olursa uygulama otomatik olarak Android yerel TTS'e geÃ§er.
 class EdgeTts {
   static const _token = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-  static const _versions = ['142.0.3595.94', '134.0.3124.66', '130.0.2849.68'];
+  static const _versions = ['143.0.3650.75', '142.0.3595.94', '134.0.3124.66', '130.0.2849.68'];
+  static const _base = 'speech.platform.bing.com/consumer/speech/synthesize/readaloud';
+  static String? _goodVersion;
+  static int _skewSec = 0;
+
+  static String _ua(String ver) {
+    final major = ver.split('.').first;
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0';
+  }
 
   static String _gec() {
-    var ticks = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000 + 11644473600;
+    var ticks = DateTime.now().toUtc().millisecondsSinceEpoch ~/ 1000 + _skewSec + 11644473600;
     ticks -= ticks % 300;
     ticks *= 10000000;
     return sha256.convert(ascii.encode('$ticks$_token')).toString().toUpperCase();
@@ -300,99 +352,227 @@ class EdgeTts {
         '${p(t.hour)}:${p(t.minute)}:${p(t.second)} GMT+0000 (Coordinated Universal Time)';
   }
 
-  static Future<EdgeResult> synth(String text, {String rate = '+0%'}) async {
-    Object? last;
-    for (final ver in _versions) {
-      try {
-        return await _once(text, rate, ver);
-      } catch (e) {
-        last = e;
+  static Future<void> _syncClock() async {
+    try {
+      final r = await http
+          .get(
+            Uri.parse('https://$_base/voices/list?trustedclienttoken=$_token'),
+            headers: {'User-Agent': _ua(_versions.first)},
+          )
+          .timeout(const Duration(seconds: 10));
+      final date = r.headers['date'];
+      if (date != null) {
+        _skewSec = HttpDate.parse(date).difference(DateTime.now().toUtc()).inSeconds;
       }
+    } catch (_) {}
+  }
+
+  static Future<EdgeResult> synth(String text, void Function(String) log, {String rate = '+5%'}) async {
+    Object? last;
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      await _syncClock();
+      final good = _goodVersion;
+      final versions = <String>[if (good != null) good, ..._versions.where((v) => v != good)];
+      for (final ver in versions) {
+        try {
+          final r = await _once(text, rate, ver);
+          _goodVersion = ver;
+          return r;
+        } catch (e) {
+          last = e;
+          log('Edge-TTS (v$ver, deneme $attempt/3): ${shortErr(e)}');
+          final msg = '$e';
+          final rejected = msg.contains('403') || msg.contains('401') || msg.contains('not upgraded');
+          if (!rejected) break;
+        }
+      }
+      await Future.delayed(Duration(seconds: 2 * attempt));
     }
-    throw Exception('Edge-TTS baÅŸarÄ±sÄ±z: $last');
+    throw Exception('Edge-TTS 3 denemede de yanıt vermedi: ${shortErr(last)}');
   }
 
   static Future<EdgeResult> _once(String text, String rate, String ver) async {
     final major = ver.split('.').first;
-    final url = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
-        '?TrustedClientToken=$_token&Sec-MS-GEC=${_gec()}&Sec-MS-GEC-Version=1-$ver'
-        '&ConnectionId=${_hex(32)}';
-    final ws = await WebSocket.connect(url, headers: {
-      'Pragma': 'no-cache',
-      'Cache-Control': 'no-cache',
-      'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
-          'Chrome/$major.0.0.0 Safari/537.36 Edg/$major.0.0.0',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cookie': 'muid=${_hex(32).toUpperCase()};',
-    }).timeout(const Duration(seconds: 20));
+    final url = 'wss://$_base/edge/v1?TrustedClientToken=$_token&Sec-MS-GEC=${_gec()}'
+        '&Sec-MS-GEC-Version=1-$ver&ConnectionId=${_hex(32)}';
 
-    final audio = BytesBuilder();
-    final words = <WordTiming>[];
-    final done = Completer<void>();
-
-    ws.listen(
-      (dynamic data) {
-        if (data is String) {
-          if (data.contains('Path:turn.end')) {
-            if (!done.isCompleted) done.complete();
-          } else if (data.contains('Path:audio.metadata')) {
-            try {
-              final body = data.substring(data.indexOf('\r\n\r\n') + 4);
-              final j = jsonDecode(body);
-              for (final m in (j['Metadata'] as List)) {
-                if (m['Type'] == 'WordBoundary') {
-                  final dd = m['Data'];
-                  final off = (dd['Offset'] as num) / 1e7;
-                  final dur = (dd['Duration'] as num) / 1e7;
-                  words.add(WordTiming('${dd['text']['Text']}', off.toDouble(), (off + dur).toDouble()));
-                }
-              }
-            } catch (_) {}
-          }
-        } else if (data is List<int>) {
-          final b = Uint8List.fromList(data);
-          if (b.length < 2) return;
-          final hl = (b[0] << 8) | b[1];
-          if (b.length < 2 + hl) return;
-          final header = utf8.decode(b.sublist(2, 2 + hl), allowMalformed: true);
-          if (header.contains('Path:audio')) audio.add(b.sublist(2 + hl));
-        }
-      },
-      onError: (Object e) {
-        if (!done.isCompleted) done.completeError(e);
-      },
-      onDone: () {
-        if (!done.isCompleted) done.completeError(StateError('BaÄŸlantÄ± erken kapandÄ±'));
-      },
-    );
-
-    final ts = _jsTime();
-    ws.add(
-      'X-Timestamp:$ts\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n'
-      '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false",'
-      '"wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n',
-    );
-    final esc = text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&apos;');
-    final ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='tr-TR'>"
-        "<voice name='$kEdgeVoice'><prosody pitch='+0Hz' rate='$rate' volume='+0%'>$esc</prosody></voice></speak>";
-    ws.add(
-      'X-RequestId:${_hex(32)}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml',
-    );
-
+    final client = HttpClient()
+      ..userAgent = _ua(ver)
+      ..connectionTimeout = const Duration(seconds: 20);
+    WebSocket? opened;
     try {
+      final socket = await WebSocket.connect(
+        url,
+        headers: {
+          'Pragma': 'no-cache',
+          'Cache-Control': 'no-cache',
+          'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Sec-CH-UA': '" Not;A Brand";v="99", "Microsoft Edge";v="$major", "Chromium";v="$major"',
+          'Sec-CH-UA-Mobile': '?0',
+          'Sec-Fetch-Site': 'none',
+          'Sec-Fetch-Mode': 'websocket',
+          'Sec-Fetch-Dest': 'empty',
+          'Cookie': 'muid=${_hex(32).toUpperCase()};',
+        },
+        compression: CompressionOptions.compressionOff,
+        customClient: client,
+      ).timeout(const Duration(seconds: 25));
+      opened = socket;
+
+      final audio = BytesBuilder();
+      final words = <WordTiming>[];
+      final done = Completer<void>();
+
+      socket.listen(
+        (dynamic data) {
+          if (data is String) {
+            if (data.contains('Path:turn.end')) {
+              if (!done.isCompleted) done.complete();
+            } else if (data.contains('Path:audio.metadata')) {
+              try {
+                final body = data.substring(data.indexOf('\r\n\r\n') + 4);
+                final j = jsonDecode(body);
+                for (final m in (j['Metadata'] as List)) {
+                  if (m['Type'] == 'WordBoundary') {
+                    final dd = m['Data'];
+                    final off = (dd['Offset'] as num) / 1e7;
+                    final dur = (dd['Duration'] as num) / 1e7;
+                    words.add(WordTiming('${dd['text']['Text']}', off.toDouble(), (off + dur).toDouble()));
+                  }
+                }
+              } catch (_) {}
+            }
+          } else if (data is List<int>) {
+            final b = Uint8List.fromList(data);
+            if (b.length < 2) return;
+            final hl = (b[0] << 8) | b[1];
+            if (b.length < 2 + hl) return;
+            final header = utf8.decode(b.sublist(2, 2 + hl), allowMalformed: true);
+            if (header.contains('Path:audio')) audio.add(b.sublist(2 + hl));
+          }
+        },
+        onError: (Object e) {
+          if (!done.isCompleted) done.completeError(e);
+        },
+        onDone: () {
+          if (!done.isCompleted) done.completeError(StateError('Bağlantı erken kapandı'));
+        },
+      );
+
+      final ts = _jsTime();
+      socket.add(
+        'X-Timestamp:$ts\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n'
+        '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false",'
+        '"wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-96kbitrate-mono-mp3"}}}}\r\n',
+      );
+      final esc = text
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&apos;');
+      final ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='tr-TR'>"
+          "<voice name='$kEdgeVoice'><prosody pitch='+0Hz' rate='$rate' volume='+0%'>$esc</prosody></voice></speak>";
+      socket.add(
+        'X-RequestId:${_hex(32)}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n$ssml',
+      );
+
       await done.future.timeout(const Duration(seconds: 60));
+      final bytes = audio.toBytes();
+      if (bytes.length < 1000) throw Exception('Boş ses döndü');
+      return EdgeResult(bytes, words);
     } finally {
-      await ws.close();
+      if (opened != null) {
+        try {
+          await opened.close().timeout(const Duration(seconds: 5));
+        } catch (_) {}
+      }
+      client.close(force: true);
     }
-    final bytes = audio.toBytes();
-    if (bytes.length < 1000) throw Exception('BoÅŸ ses dÃ¶ndÃ¼');
-    return EdgeResult(bytes, words);
+  }
+}
+
+/// Fallback: Google Translate TTS
+class GoogleTts {
+  static const _ua =
+      'Mozilla/5.0 (Linux; Android 14; SM-S926B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+
+  static List<String> _chunks(String text, {int max = 180}) {
+    final out = <String>[];
+    var cur = '';
+    final sentences = RegExp(r'[^.!?;:]+[.!?;:]*')
+        .allMatches(text)
+        .map((m) => m.group(0)!.trim())
+        .where((s) => s.isNotEmpty);
+    for (final s in sentences) {
+      if (s.length > max) {
+        if (cur.isNotEmpty) {
+          out.add(cur);
+          cur = '';
+        }
+        var buf = '';
+        for (final w in s.split(' ')) {
+          final next = buf.isEmpty ? w : '$buf $w';
+          if (next.length > max && buf.isNotEmpty) {
+            out.add(buf);
+            buf = w;
+          } else {
+            buf = next;
+          }
+        }
+        if (buf.isNotEmpty) out.add(buf);
+      } else {
+        final next = cur.isEmpty ? s : '$cur $s';
+        if (next.length > max) {
+          out.add(cur);
+          cur = s;
+        } else {
+          cur = next;
+        }
+      }
+    }
+    if (cur.isNotEmpty) out.add(cur);
+    return out;
+  }
+
+  static Future<File> synth(String text, int idx, Directory dir) async {
+    final chunks = _chunks(text);
+    if (chunks.isEmpty) throw Exception('Boş metin');
+    final files = <File>[];
+    for (var c = 0; c < chunks.length; c++) {
+      final f = File('${dir.path}/g_${idx}_$c.mp3');
+      Object? last;
+      var ok = false;
+      for (var attempt = 1; attempt <= 3 && !ok; attempt++) {
+        try {
+          final url = Uri.parse(
+            'https://translate.google.com/translate_tts?ie=UTF-8&tl=tr&client=tw-ob'
+            '&total=1&idx=0&textlen=${chunks[c].length}&q=${Uri.encodeComponent(chunks[c])}',
+          );
+          final r = await http
+              .get(url, headers: {'User-Agent': _ua, 'Referer': 'https://translate.google.com/'})
+              .timeout(const Duration(seconds: 30));
+          final ct = r.headers['content-type'] ?? '';
+          if (r.statusCode == 200 && ct.contains('audio') && r.bodyBytes.length > 500) {
+            await f.writeAsBytes(r.bodyBytes);
+            ok = true;
+          } else {
+            last = 'HTTP ${r.statusCode} $ct';
+          }
+        } catch (e) {
+          last = e;
+        }
+        if (!ok) await Future.delayed(Duration(seconds: 2 * attempt));
+      }
+      if (!ok) throw Exception('Google TTS parça ${c + 1}/${chunks.length}: ${shortErr(last)}');
+      files.add(f);
+    }
+    final list = File('${dir.path}/g_${idx}_list.txt');
+    await list.writeAsString(files.map((f) => "file '${f.path}'\n").join());
+    final out = File('${dir.path}/vo_$idx.wav');
+    await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', list.path, '-ar', '44100', '-ac', '2', out.path]);
+    return out;
   }
 }
 
@@ -402,7 +582,7 @@ class AndroidTts {
     final ok = await tts.isLanguageAvailable('tr-TR');
     if (ok != true) {
       throw Exception(
-        'Telefonda TÃ¼rkÃ§e TTS sesi yok. Ayarlar > Genel yÃ¶netim > Metin okuma bÃ¶lÃ¼mÃ¼nden TÃ¼rkÃ§e ses verisini indirin.',
+        'Telefonda Türkçe TTS sesi yok. Ayarlar > Genel yönetim > Metin okuma bölümünden Türkçe ses verisini indirin.',
       );
     }
     await tts.setLanguage('tr-TR');
@@ -410,25 +590,71 @@ class AndroidTts {
     await tts.awaitSynthCompletion(true);
     await tts.synthesizeToFile(text, path, true);
     final f = File(path);
-    if (!await f.exists() || await f.length() < 1000) throw Exception('Android TTS dosya Ã¼retemedi.');
+    if (!await f.exists() || await f.length() < 1000) throw Exception('Android TTS dosya üretemedi.');
     return f;
   }
 }
 
+enum _Engine {
+  edge('Edge-TTS (AhmetNeural)'),
+  google('Google Translate TTS'),
+  android('Android yerel TTS');
+
+  const _Engine(this.label);
+  final String label;
+}
+
 class TtsService {
-  static Future<SceneAudio> synth(String text, int i, Directory dir, void Function(String) log) async {
-    File? src;
+  static Future<List<SceneAudio>> synthAll(
+    List<Scene> scenes,
+    Directory dir,
+    void Function(String) log,
+    void Function(int done) onSceneDone,
+  ) async {
+    var e = 0;
+    while (true) {
+      final engine = _Engine.values[e];
+      log('Seslendirme motoru: ${engine.label}');
+      final results = <SceneAudio>[];
+      var failed = false;
+      for (var i = 0; i < scenes.length; i++) {
+        try {
+          results.add(await _synthOne(engine, scenes[i].voiceover, i, dir, log));
+          onSceneDone(i + 1);
+        } catch (err) {
+          log('${engine.label} başarısız (sahne ${i + 1}): ${shortErr(err)}');
+          failed = true;
+          break;
+        }
+      }
+      if (!failed) return results;
+      e++;
+      if (e >= _Engine.values.length) {
+        throw Exception('Hiçbir seslendirme motoru çalışmadı. İnternet bağlantınızı ve telefonun Türkçe TTS verisini kontrol edin.');
+      }
+      log('Sonraki motora geçiliyor: ${_Engine.values[e].label}');
+    }
+  }
+
+  static Future<SceneAudio> _synthOne(
+    _Engine engine,
+    String text,
+    int i,
+    Directory dir,
+    void Function(String) log,
+  ) async {
+    File src;
     var words = <WordTiming>[];
-    try {
-      final r = await EdgeTts.synth(text);
+    if (engine == _Engine.edge) {
+      final r = await EdgeTts.synth(text, log);
       src = File('${dir.path}/vo_$i.mp3');
       await src.writeAsBytes(r.audio);
       words = r.words;
-      log('Sahne ${i + 1}: Edge-TTS (AhmetNeural)');
-    } catch (e) {
-      log('Sahne ${i + 1}: Edge-TTS olmadÄ±, Android TTS kullanÄ±lÄ±yor.');
+    } else if (engine == _Engine.google) {
+      src = await GoogleTts.synth(text, i, dir);
+    } else {
+      src = await AndroidTts.synth(text, '${dir.path}/vo_$i.wav');
     }
-    src ??= await AndroidTts.synth(text, '${dir.path}/vo_$i.wav');
 
     final speech = await probeDuration(src.path);
     final out = File('${dir.path}/vo_${i}_pad.wav');
@@ -439,7 +665,6 @@ class TtsService {
     return SceneAudio(out, speech, words);
   }
 
-  /// Kelime zamanÄ± gelmediyse: karakter sayÄ±sÄ±yla orantÄ±lÄ± tahmin.
   static List<WordTiming> _estimateWords(String text, double speech) {
     final toks = text.split(RegExp(r'\s+')).where((t) => t.isNotEmpty).toList();
     double weight(String t) {
@@ -472,8 +697,19 @@ class TtsService {
   }
 }
 
-// ============================ 4) ALTYAZI (ASS) ============================
+// ============================ 4) SUBTITLES (ASS) ============================
+class _Ev {
+  _Ev(this.start, this.end, this.text);
+  double start;
+  double end;
+  final String text;
+}
+
 class SubtitleBuilder {
+  static final RegExp _strip = RegExp(
+    '^[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+|[.,;:"\'\u00AB\u00BB\u2026\\-\u2013\u2014()]+\$',
+  );
+
   static String _t(double t) {
     final cs = (max(t, 0) * 100).round();
     String p(int v) => v.toString().padLeft(2, '0');
@@ -485,49 +721,71 @@ class SubtitleBuilder {
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,$kSubtitleFont,96,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,8,2,2,60,60,520,1
+Style: Main,$kSubtitleFont,78,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,6,0,2,70,70,400,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 ''';
-    final strip = RegExp(r'''^[.,;:"'Â«Â»â€¦\-â€“â€”()]+|[.,;:"'Â«Â»â€¦\-â€“â€”()]+$''');
+
     final clean = words.map((w) {
-      final c = trUpper(w.text.replaceAll(strip, ''));
+      final c = trUpper(w.text.replaceAll(_strip, ''));
       return WordTiming(c.isEmpty ? w.text : c, w.start, w.end);
     }).toList();
 
-    // 3'lÃ¼ gruplar; noktalama veya uzun duraklamada bÃ¶l
+    const maxWords = 3;
+    const maxChars = 15;
     final groups = <List<int>>[];
     var cur = <int>[];
+    var curLen = 0;
     for (var i = 0; i < clean.length; i++) {
-      cur.add(i);
-      final raw = words[i].text;
-      final gap = i + 1 < clean.length ? clean[i + 1].start - clean[i].end : 0.0;
-      if (cur.length >= 3 || RegExp(r'[.?!,]$').hasMatch(raw) || gap > 0.5) {
+      final len = clean[i].text.length;
+      final wouldBe = curLen + (cur.isEmpty ? 0 : 1) + len;
+      if (cur.isNotEmpty && (cur.length >= maxWords || wouldBe > maxChars)) {
         groups.add(cur);
         cur = <int>[];
+        curLen = 0;
+      }
+      curLen += (cur.isEmpty ? 0 : 1) + len;
+      cur.add(i);
+      final gap = i + 1 < clean.length ? clean[i + 1].start - clean[i].end : 0.0;
+      if (RegExp(r'[.?!,]$').hasMatch(words[i].text) || gap > 0.5) {
+        groups.add(cur);
+        cur = <int>[];
+        curLen = 0;
       }
     }
     if (cur.isNotEmpty) groups.add(cur);
 
-    final lines = StringBuffer();
+    final events = <_Ev>[];
     for (final g in groups) {
       for (var pos = 0; pos < g.length; pos++) {
         final wi = g[pos];
         final start = clean[wi].start;
-        var end = pos + 1 < g.length ? clean[g[pos + 1]].start : clean[wi].end + 0.12;
-        if (end <= start) end = start + 0.1;
-        final text = g.map((j) => j == wi ? '{\\1c&H00FFFF&}${clean[j].text}{\\1c&HFFFFFF&}' : clean[j].text).join(' ');
-        lines.writeln('Dialogue: 0,${_t(start)},${_t(end)},Main,,0,0,0,,$text');
+        final end = pos + 1 < g.length ? clean[g[pos + 1]].start : clean[wi].end + 0.10;
+        final text = g
+            .map((j) => j == wi ? '{\\1c&H00FFFF&}${clean[j].text}{\\1c&HFFFFFF&}' : clean[j].text)
+            .join(' ');
+        events.add(_Ev(start, max(end, start + 0.06), text));
       }
     }
+
+    events.sort((a, b) => a.start.compareTo(b.start));
+    for (var k = 0; k + 1 < events.length; k++) {
+      if (events[k].end > events[k + 1].start) events[k].end = events[k + 1].start;
+    }
+
+    final lines = StringBuffer();
+    for (final e in events) {
+      if (e.end - e.start < 0.02) continue;
+      lines.writeln('Dialogue: 0,${_t(e.start)},${_t(e.end)},Main,,0,0,0,,${e.text}');
+    }
     final f = File('${dir.path}/subs.ass');
-    await f.writeAsString(head + lines.toString());
+    await f.writeAsBytes(utf8.encode(head + lines.toString())); // Zorunlu UTF-8
     return f;
   }
 }
@@ -540,15 +798,15 @@ class Renderer {
     const cx = 'iw/2-(iw/zoom/2)';
     const cy = 'ih/2-(ih/zoom/2)';
     switch (kind) {
-      case 'zoom_in': // merkeze yaklaÅŸma
+      case 'zoom_in':
         return "z='1+0.30*on/$n':x='$cx':y='$cy'";
       case 'zoom_out':
         return "z='1.30-0.30*on/$n':x='$cx':y='$cy'";
-      case 'pan_down': // yukarÄ±dan aÅŸaÄŸÄ±ya kayma
+      case 'pan_down':
         return "z='1.25':x='$cx':y='(ih-ih/zoom)*on/$n'";
       case 'pan_up':
         return "z='1.25':x='$cx':y='(ih-ih/zoom)*(1-on/$n)'";
-      default: // pan_right
+      default:
         return "z='1.25':x='(iw-iw/zoom)*on/$n':y='$cy'";
     }
   }
@@ -571,17 +829,16 @@ class Renderer {
 
     final args = <String>['-y'];
     for (final img in images) {
-      args.addAll(['-i', img.path]); // 0..n-1
+      args.addAll(['-i', img.path]);
     }
-    args.addAll(['-i', voice.path]); // n
+    args.addAll(['-i', voice.path]);
     final d = (total + 2).toStringAsFixed(2);
     for (final f in ['55', '82.41', '110.5']) {
-      args.addAll(['-f', 'lavfi', '-i', 'sine=frequency=$f:sample_rate=44100:duration=$d']); // n+1..n+3
+      args.addAll(['-f', 'lavfi', '-i', 'sine=frequency=$f:sample_rate=44100:duration=$d']);
     }
-    args.addAll(['-f', 'lavfi', '-i', 'anoisesrc=color=brown:amplitude=0.25:sample_rate=44100:duration=$d']); // n+4
+    args.addAll(['-f', 'lavfi', '-i', 'anoisesrc=color=brown:amplitude=0.25:sample_rate=44100:duration=$d']);
 
     final fc = StringBuffer();
-    // --- Video: her sahne iÃ§in Ken Burns, sonra birleÅŸtir + renk + altyazÄ±
     for (var i = 0; i < n; i++) {
       final frames = max(2, (durations[i] * kFps).round());
       fc.write('[$i:v]scale=1620:2880:force_original_aspect_ratio=increase,crop=1620:2880,setsar=1,'
@@ -593,7 +850,6 @@ class Renderer {
     }
     fc.write('concat=n=$n:v=1:a=0,$grade,ass=filename=${ass.path}:fontsdir=/system/fonts[vout];');
 
-    // --- Ses: sentez gerilim mÃ¼ziÄŸi + audio ducking (konuÅŸmada â‰ˆ %15)
     final a = n + 1;
     fc.write('[$n:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,asplit=2[vsc][vmix];');
     fc.write('[$a:a]volume=0.55[a0];');
@@ -622,7 +878,7 @@ class Renderer {
   }
 }
 
-// ============================ 6) ANA AKIÅ ============================
+// ============================ 6) PIPELINE ============================
 class Pipeline {
   Pipeline({required this.onStage, required this.onLog});
   final void Function(int step, String label, double progress) onStage;
@@ -636,34 +892,36 @@ class Pipeline {
       if (await dir.exists()) await dir.delete(recursive: true);
       await dir.create(recursive: true);
 
-      // --- [1/4] Senaryo + gÃ¶rseller
-      onStage(1, '[1/4] GÃ¶rseller indiriliyor...', 0.01);
+      // --- [1/4] Script + images
+      onStage(1, '[1/4] Görseller indiriliyor...', 0.01);
       final Scenario scenario;
       if (ScenarioService.looksLikeJson(input)) {
-        onLog('YapÄ±ÅŸtÄ±rÄ±lan JSON ayrÄ±ÅŸtÄ±rÄ±lÄ±yor...');
+        onLog('Yapıştırılan JSON ayrıştırılıyor...');
         scenario = ScenarioService.parse(input);
       } else {
-        onLog('Konu iÃ§in senaryo yazÄ±lÄ±yor (Pollinations)...');
+        onLog('Konu için senaryo yazılıyor (Pollinations)...');
         scenario = await ScenarioService.fromTopic(input);
       }
-      onLog('BaÅŸlÄ±k: ${scenario.title} â€¢ ${scenario.scenes.length} sahne');
+      onLog('Başlık: ${scenario.title} • ${scenario.scenes.length} sahne');
       final n = scenario.scenes.length;
 
-      final images = <File>[];
+      final rawImages = <File?>[];
       for (var i = 0; i < n; i++) {
-        onLog('GÃ¶rsel ${i + 1}/$n indiriliyor...');
-        images.add(await ImageService.fetch(scenario.scenes[i], i, dir, style.suffix));
-        onStage(1, '[1/4] GÃ¶rseller indiriliyor... (${i + 1}/$n)', 0.05 + 0.30 * (i + 1) / n);
-        if (i < n - 1) await Future.delayed(const Duration(seconds: 2)); // sunucuya nazik ol
+        onLog('Görsel ${i + 1}/$n indiriliyor...');
+        rawImages.add(await ImageService.tryFetch(scenario.scenes[i], i, dir, style.suffix, onLog));
+        onStage(1, '[1/4] Görseller indiriliyor... (${i + 1}/$n)', 0.05 + 0.30 * (i + 1) / n);
+        if (i < n - 1) await Future.delayed(const Duration(seconds: 2));
       }
+      final images = await ImageService.fillGaps(rawImages, dir, onLog);
 
-      // --- [2/4] Seslendirme
+      // --- [2/4] Voice
       onStage(2, '[2/4] Seslendiriliyor...', 0.35);
-      final audios = <SceneAudio>[];
-      for (var i = 0; i < n; i++) {
-        audios.add(await TtsService.synth(scenario.scenes[i].voiceover, i, dir, onLog));
-        onStage(2, '[2/4] Seslendiriliyor... (${i + 1}/$n)', 0.35 + 0.15 * (i + 1) / n);
-      }
+      final audios = await TtsService.synthAll(
+        scenario.scenes,
+        dir,
+        onLog,
+        (done) => onStage(2, '[2/4] Seslendiriliyor... ($done/$n)', 0.35 + 0.15 * done / n),
+      );
       final voice = await TtsService.concatVoice(audios, dir);
 
       final durations = audios.map((a) => a.totalSec).toList();
@@ -677,11 +935,11 @@ class Pipeline {
         offset += audios[i].totalSec;
       }
       final total = durations.fold<double>(0, (a, b) => a + b);
-      onLog('Toplam sÃ¼re: ${total.toStringAsFixed(1)} sn');
+      onLog('Toplam süre: ${total.toStringAsFixed(1)} sn');
       final ass = await SubtitleBuilder.build(allWords, dir);
 
       // --- [3/4] Render
-      onStage(3, '[3/4] FFmpeg ile render alÄ±nÄ±yor...', 0.52);
+      onStage(3, '[3/4] FFmpeg ile render alınıyor...', 0.52);
       final outPath = '${dir.path}/final_shorts.mp4';
       await Renderer.render(
         images: images,
@@ -690,10 +948,10 @@ class Pipeline {
         ass: ass,
         grade: style.grade,
         outPath: outPath,
-        onProgress: (f) => onStage(3, '[3/4] FFmpeg ile render alÄ±nÄ±yor... %${(f * 100).round()}', 0.52 + 0.43 * f),
+        onProgress: (f) => onStage(3, '[3/4] FFmpeg ile render alınıyor... %${(f * 100).round()}', 0.52 + 0.43 * f),
       );
 
-      // --- [4/4] Galeriye kaydet
+      // --- [4/4] Save to gallery
       if (!await Gal.hasAccess(toAlbum: true)) await Gal.requestAccess(toAlbum: true);
       await Gal.putVideo(outPath, album: 'Shorts Studio');
       onStage(4, '[4/4] Galeriye kaydedildi! (Galeri > Shorts Studio)', 1.0);
@@ -704,7 +962,7 @@ class Pipeline {
   }
 }
 
-// ============================ ARAYÃœZ ============================
+// ============================ UI ============================
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const ShortsApp());
@@ -749,7 +1007,7 @@ class _HomePageState extends State<HomePage> {
   final List<String> _logs = [];
 
   static const _steps = [
-    'GÃ¶rseller indiriliyor',
+    'Görseller indiriliyor',
     'Seslendiriliyor',
     'FFmpeg ile render',
     'Galeriye kaydedildi',
@@ -765,14 +1023,14 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() {
       _logs.add(m);
-      if (_logs.length > 80) _logs.removeAt(0);
+      if (_logs.length > 120) _logs.removeAt(0);
     });
   }
 
   Future<void> _start() async {
     final text = _input.text.trim();
     if (text.isEmpty) {
-      setState(() => _error = 'LÃ¼tfen bir konu yazÄ±n veya Gemini JSON senaryosunu yapÄ±ÅŸtÄ±rÄ±n.');
+      setState(() => _error = 'Lütfen bir konu yazın veya Gemini JSON senaryosunu yapıştırın.');
       return;
     }
     FocusScope.of(context).unfocus();
@@ -782,7 +1040,7 @@ class _HomePageState extends State<HomePage> {
       _resultPath = null;
       _step = 1;
       _progress = 0;
-      _stageLabel = 'BaÅŸlÄ±yor...';
+      _stageLabel = 'Başlıyor...';
       _logs.clear();
     });
     try {
@@ -816,7 +1074,7 @@ class _HomePageState extends State<HomePage> {
     await Clipboard.setData(ClipboardData(text: scriptPrompt(topic)));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Ä°stem kopyalandÄ±. Gemini Web\'e yapÄ±ÅŸtÄ±rÄ±n, dÃ¶nen JSON\'u buraya koyun.')),
+      const SnackBar(content: Text('İstem kopyalandı. Gemini Web\'e yapıştırın, dönen JSON\'u buraya koyun.')),
     );
   }
 
@@ -835,8 +1093,8 @@ class _HomePageState extends State<HomePage> {
               minLines: 5,
               maxLines: 10,
               decoration: InputDecoration(
-                labelText: 'Senaryo JSON\'Ä± / Konu',
-                hintText: 'Ã–rn: YazÄ±lmÄ±ÅŸ en tehlikeli kitap\n\nveya Gemini Web\'den kopyaladÄ±ÄŸÄ±nÄ±z JSON',
+                labelText: 'Senaryo JSON\'ı / Konu',
+                hintText: 'Örn: Yazılmış en tehlikeli kitap\n\nveya Gemini Web\'den kopyaladığınız JSON',
                 filled: true,
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none),
               ),
@@ -851,7 +1109,7 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
             const SizedBox(height: 8),
-            Text('Videonun tarzÄ±', style: Theme.of(context).textTheme.labelLarge),
+            Text('Videonun tarzı', style: Theme.of(context).textTheme.labelLarge),
             const SizedBox(height: 8),
             SegmentedButton<VideoStyle>(
               showSelectedIcon: false,
@@ -863,7 +1121,7 @@ class _HomePageState extends State<HomePage> {
             FilledButton.icon(
               onPressed: _busy ? null : _start,
               icon: const Icon(Icons.movie_creation_rounded),
-              label: const Padding(padding: EdgeInsets.symmetric(vertical: 14), child: Text('Videoyu OluÅŸtur')),
+              label: const Padding(padding: EdgeInsets.symmetric(vertical: 14), child: Text('Videoyu Oluştur')),
             ),
             if (_busy || _step > 0) ...[
               const SizedBox(height: 20),
@@ -890,7 +1148,7 @@ class _HomePageState extends State<HomePage> {
                       if (_busy)
                         const Padding(
                           padding: EdgeInsets.only(top: 8),
-                          child: Text('Uygulamadan Ã§Ä±kmayÄ±n; ekran aÃ§Ä±k kalÄ±r.',
+                          child: Text('Uygulamadan çıkmayın; ekran açık kalır.',
                               style: TextStyle(fontSize: 12, color: Colors.white54)),
                         ),
                     ],
@@ -915,13 +1173,13 @@ class _HomePageState extends State<HomePage> {
               OutlinedButton.icon(
                 onPressed: () => Share.shareXFiles([XFile(_resultPath!)], text: 'final_shorts.mp4'),
                 icon: const Icon(Icons.share_rounded),
-                label: const Text('PaylaÅŸ'),
+                label: const Text('Paylaş'),
               ),
             ],
             if (_logs.isNotEmpty) ...[
               const SizedBox(height: 16),
               ExpansionTile(
-                title: const Text('AyrÄ±ntÄ±lÄ± gÃ¼nlÃ¼k'),
+                title: const Text('Ayrıntılı günlük'),
                 children: [Align(alignment: Alignment.centerLeft, child: SelectableText(_logs.join('\n')))],
               ),
             ],
